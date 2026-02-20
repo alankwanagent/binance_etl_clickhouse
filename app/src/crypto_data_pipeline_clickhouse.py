@@ -58,6 +58,11 @@ class BinanceDataFetcher:
         self.con = con
         self.config = config or load_config()
 
+        # Override workers from config
+        rate_limits = self.config.get('rate_limits', {})
+        self.SPOT_MAX_WORKERS = rate_limits.get('spot_workers', self.SPOT_MAX_WORKERS)
+        self.FUTURES_MAX_WORKERS = rate_limits.get('futures_workers', self.FUTURES_MAX_WORKERS)
+
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
