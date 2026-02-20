@@ -1,0 +1,7 @@
+binance-connector>=3.7.0
+binance-futures-connector>=4.1.0
+clickhouse-driver>=0.2.6
+pandas>=2.0.0
+ratelimit>=2.2.3
+tenacity>=8.2.3
+tqdm>=4.66.0

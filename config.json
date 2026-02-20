@@ -1,0 +1,28 @@
+{
+  "clickhouse": {
+    "host": "localhost",
+    "port": 9000,
+    "database": "binance_v2",
+    "username": "claude",
+    "password": "iamsentient",
+    "secure": false
+  },
+  "bars": {
+    "intervals": ["1m", "1h"],
+    "start_date": "2025-01-01",
+    "symbols": {
+      "spot": {
+        "enabled": true,
+        "quote_assets": ["USDT", "USDC"]
+      },
+      "perpetual": {
+        "enabled": true
+      }
+    }
+  },
+  "rate_limits": {
+    "spot_workers": 10,
+    "futures_workers": 8,
+    "update_interval_seconds": 3600
+  }
+}

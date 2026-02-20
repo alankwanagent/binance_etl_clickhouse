@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  binance-etl:
+    build: .
+    container_name: binance_etl_clickhouse
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TZ=UTC
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    network_mode: "host"
+
+  # Optional: ClickHouse service if you want to run it in Docker too
+  # clickhouse:
+  #   image: clickhouse/clickhouse-server:latest
+  #   container_name: clickhouse
+  #   ports:
+  #     - "9000:9000"
+  #     - "8123:8123"
+  #   volumes:
+  #     - clickhouse_data:/var/lib/clickhouse
+  #   environment:
+  #     - CLICKHOUSE_USER=claude
+  #     - CLICKHOUSE_PASSWORD=iamsentient
+  #
+  # volumes:
+  #   clickhouse_data:
