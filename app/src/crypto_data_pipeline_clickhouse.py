@@ -1,5 +1,6 @@
 """
 Binance ETL Pipeline for ClickHouse - Optimized for multiple bar intervals
+Caches to disk (parquet) before loading to ClickHouse for memory efficiency
 """
 import os
 import re
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Callable, Optional, Union
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
@@ -21,6 +23,9 @@ from binance.spot import Spot
 from binance.um_futures import UMFutures
 
 from utils_clickhouse import connect_clickhouse, clickhouse_query, clickhouse_insert
+
+# Cache directory for parquet files
+CACHE_DIR = Path(__file__).parent.parent.parent / 'cache'
 
 
 # Load config
@@ -274,12 +279,26 @@ class BinanceDataFetcher:
             self.logger.error(f"Error fetching historical kline data for {symbol}: {e}")
             raise
 
-    def fetch_market_klines_threadpool(self, type: str,
-                                        start_time: Union[str, datetime, int],
-                                        end_time: Union[str, datetime, int],
-                                        interval: str = '1m') -> pd.DataFrame:
-        """Fetch historical kline data using thread pool"""
+    def fetch_market_klines_to_cache(self, type: str,
+                                      start_time: Union[str, datetime, int],
+                                      end_time: Union[str, datetime, int],
+                                      interval: str = '1m',
+                                      cache_dir: Path = None) -> int:
+        """Fetch klines and cache to parquet files per symbol (disk-based, memory efficient)"""
         try:
+            if cache_dir is None:
+                cache_dir = CACHE_DIR / f"{type.lower()}_{interval}"
+
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # Track progress file
+            progress_file = cache_dir / 'progress.json'
+            if progress_file.exists():
+                with open(progress_file) as f:
+                    completed = set(json.load(f).get('completed', []))
+            else:
+                completed = set()
+
             if type == 'PERPETUAL':
                 symbols_df = clickhouse_query(self.con,
                     f"""SELECT symbol, delivery_date
@@ -294,20 +313,29 @@ class BinanceDataFetcher:
             else:
                 raise ValueError(f"Invalid type: {type}")
 
+            # Filter already completed
+            symbols_to_fetch = [s for s in symbols_df['symbol'].tolist() if s not in completed]
+
             self.logger.info(
-                f"Fetching {interval} klines for {len(symbols_df)} "
-                f"{type} symbols using {max_workers} threads"
+                f"Fetching {interval} klines for {len(symbols_to_fetch)}/{len(symbols_df)} "
+                f"{type} symbols (skipping {len(completed)} completed)"
             )
 
             if end_time is None:
                 end_time = datetime.now(timezone.utc)
 
-            all_results = []
             failed_symbols = []
-            result_lock = threading.Lock()
+            completed_lock = threading.Lock()
+            total_rows = 0
 
             def process_symbol(symbol, delivery_date=None):
+                nonlocal total_rows
                 try:
+                    # Skip if already completed
+                    with completed_lock:
+                        if symbol in completed:
+                            return
+
                     klines = self.get_historical_klines(
                         symbol=symbol,
                         type=type,
@@ -318,18 +346,44 @@ class BinanceDataFetcher:
                     )
 
                     if klines is not None and not klines.empty:
-                        with result_lock:
-                            all_results.append(klines)
-                            self.logger.info(
-                                f"Fetched {len(klines)} klines for {symbol} "
-                                f"from {pd.to_datetime(klines['timestamp'].min(), unit='ms')}"
-                            )
+                        # Process and write to parquet immediately
+                        klines['timestamp'] = pd.to_datetime(klines['timestamp'], unit='ms')
+                        klines['close_time'] = pd.to_datetime(klines['close_time'], unit='ms')
+
+                        numeric_cols = ['open', 'high', 'low', 'close', 'volume',
+                                        'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume']
+                        klines[numeric_cols] = klines[numeric_cols].astype(float)
+
+                        klines['exchange'] = 'binance'
+                        klines['type'] = type
+                        klines['interval'] = interval
+
+                        columns = ['symbol', 'exchange', 'type', 'interval', 'timestamp',
+                                   'close_time', 'open', 'high', 'low', 'close', 'volume',
+                                   'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume',
+                                   'trades_count']
+                        klines = klines[columns]
+
+                        # Write to parquet
+                        parquet_file = cache_dir / f"{symbol}.parquet"
+                        klines.to_parquet(parquet_file, index=False)
+
+                        with completed_lock:
+                            completed.add(symbol)
+                            total_rows += len(klines)
+
+                            # Save progress every 10 symbols
+                            if len(completed) % 10 == 0:
+                                with open(progress_file, 'w') as f:
+                                    json.dump({'completed': list(completed)}, f)
+
+                        self.logger.info(f"[{len(completed)}/{len(symbols_df)}] {symbol}: {len(klines)} rows -> {parquet_file.name}")
 
                 except Exception as e:
                     if '418' in str(e):
                         self._handle_rate_limit_error(e)
                         return process_symbol(symbol, delivery_date)
-                    with result_lock:
+                    with completed_lock:
                         failed_symbols.append(symbol)
                         self.logger.error(f"Error fetching {symbol}: {e}")
 
@@ -341,43 +395,23 @@ class BinanceDataFetcher:
                     delivery_date = row.get('delivery_date') if type == 'PERPETUAL' else None
                     futures.append(executor.submit(process_symbol, symbol, delivery_date))
 
-                with tqdm(total=len(futures), desc=f"Fetching {interval} klines") as pbar:
+                with tqdm(total=len(futures), desc=f"Fetching {interval} {type}") as pbar:
                     for future in futures:
                         future.result()
                         pbar.update(1)
 
+            # Save final progress
+            with open(progress_file, 'w') as f:
+                json.dump({'completed': list(completed)}, f)
+
             if failed_symbols:
-                self.logger.warning(f"Failed to fetch data for {len(failed_symbols)} symbols")
+                self.logger.warning(f"Failed to fetch data for {len(failed_symbols)} symbols: {failed_symbols[:10]}...")
 
-            if all_results:
-                result = pd.concat(all_results, axis=0)
-                result = (result
-                          .sort_values(['symbol', 'timestamp'])
-                          .drop_duplicates(subset=['symbol', 'timestamp'], keep='last')
-                          .reset_index(drop=True))
-
-                if not result.empty:
-                    result['timestamp'] = pd.to_datetime(result['timestamp'], unit='ms')
-                    result['close_time'] = pd.to_datetime(result['close_time'], unit='ms')
-
-                    numeric_cols = ['open', 'high', 'low', 'close', 'volume',
-                                    'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume']
-                    result[numeric_cols] = result[numeric_cols].astype(float)
-
-                    result['exchange'] = 'binance'
-                    result['type'] = type
-                    result['interval'] = interval
-
-                    columns = ['symbol', 'exchange', 'type', 'interval', 'timestamp',
-                               'close_time', 'open', 'high', 'low', 'close', 'volume',
-                               'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume',
-                               'trades_count']
-                    return result[columns]
-
-            return pd.DataFrame()
+            self.logger.info(f"Cached {total_rows} rows to {cache_dir}")
+            return total_rows
 
         except Exception as e:
-            self.logger.error(f"Error in fetch_market_klines: {e}")
+            self.logger.error(f"Error in fetch_market_klines_to_cache: {e}")
             raise
 
 
@@ -525,8 +559,43 @@ class CryptoDataPipeline:
             clickhouse_insert(self.con, 'bn_perp_symbols', perp_df)
             self.logger.info(f"Updated {len(perp_df)} perpetual symbols")
 
+    def load_cache_to_clickhouse(self, cache_dir: Path, table: str) -> int:
+        """Load parquet files from cache directory to ClickHouse"""
+        import pyarrow.parquet as pq
+
+        if not cache_dir.exists():
+            self.logger.warning(f"Cache directory {cache_dir} does not exist")
+            return 0
+
+        parquet_files = list(cache_dir.glob("*.parquet"))
+        if not parquet_files:
+            self.logger.warning(f"No parquet files found in {cache_dir}")
+            return 0
+
+        self.logger.info(f"Loading {len(parquet_files)} parquet files to {table}")
+
+        total_rows = 0
+        for pf in tqdm(parquet_files, desc=f"Loading to {table}"):
+            try:
+                df = pd.read_parquet(pf)
+                if not df.empty:
+                    clickhouse_insert(self.con, table, df)
+                    total_rows += len(df)
+                    # Remove parquet after successful insert
+                    pf.unlink()
+            except Exception as e:
+                self.logger.error(f"Error loading {pf}: {e}")
+
+        # Clear progress file
+        progress_file = cache_dir / 'progress.json'
+        if progress_file.exists():
+            progress_file.unlink()
+
+        self.logger.info(f"Loaded {total_rows} rows to {table}")
+        return total_rows
+
     def update_klines(self, interval: str = '1m', start_time: str = None, end_time: str = None):
-        """Update klines for a specific interval"""
+        """Update klines for a specific interval (fetch to cache, then load to ClickHouse)"""
         if start_time is None:
             start_time = self.config['bars']['start_date']
         if end_time is None:
@@ -536,27 +605,27 @@ class CryptoDataPipeline:
 
         # Update spot klines
         if self.config['bars']['symbols']['spot']['enabled']:
-            spot_df = self.fetcher.fetch_market_klines_threadpool(
+            cache_dir = CACHE_DIR / f"spot_{interval}"
+            self.fetcher.fetch_market_klines_to_cache(
                 type='SPOT',
                 start_time=start_time,
                 end_time=end_time,
-                interval=interval
+                interval=interval,
+                cache_dir=cache_dir
             )
-            if not spot_df.empty:
-                clickhouse_insert(self.con, f'bn_spot_klines_{interval_safe}', spot_df)
-                self.logger.info(f"Updated {len(spot_df)} spot klines ({interval})")
+            self.load_cache_to_clickhouse(cache_dir, f'bn_spot_klines_{interval_safe}')
 
         # Update perpetual klines
         if self.config['bars']['symbols']['perpetual']['enabled']:
-            perp_df = self.fetcher.fetch_market_klines_threadpool(
+            cache_dir = CACHE_DIR / f"perpetual_{interval}"
+            self.fetcher.fetch_market_klines_to_cache(
                 type='PERPETUAL',
                 start_time=start_time,
                 end_time=end_time,
-                interval=interval
+                interval=interval,
+                cache_dir=cache_dir
             )
-            if not perp_df.empty:
-                clickhouse_insert(self.con, f'bn_perp_klines_{interval_safe}', perp_df)
-                self.logger.info(f"Updated {len(perp_df)} perpetual klines ({interval})")
+            self.load_cache_to_clickhouse(cache_dir, f'bn_perp_klines_{interval_safe}')
 
     def update_all(self):
         """Run full update for all configured intervals"""
