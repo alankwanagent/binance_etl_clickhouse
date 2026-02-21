@@ -27,6 +27,9 @@ from utils_clickhouse import connect_clickhouse, clickhouse_query, clickhouse_in
 # Cache directory for parquet files
 CACHE_DIR = Path(__file__).parent.parent.parent / 'cache'
 
+# Set NO_PROXY to avoid proxying the proxy servers themselves
+os.environ['NO_PROXY'] = '198.204.249.42,208.110.81.34,69.30.217.114,192.151.147.90,100.117.118.21,100.101.79.51'
+
 
 # Load config
 def load_config(config_path: str = None):
@@ -496,6 +499,24 @@ class CryptoDataPipeline:
         step_size Float64
     """
 
+    FUNDING_RATES_SCHEMA = """
+        symbol LowCardinality(String),
+        exchange LowCardinality(String),
+        type LowCardinality(String),
+        fundingTime DateTime,
+        fundingRate Float64,
+        markPrice Float64
+    """
+
+    MARGIN_RATES_SCHEMA = """
+        asset LowCardinality(String),
+        exchange LowCardinality(String),
+        type LowCardinality(String),
+        timestamp DateTime,
+        dailyInterestRate Float64,
+        vipLevel Int32
+    """
+
     def __init__(self, con, api_key: Optional[str] = None, api_secret: Optional[str] = None,
                  config: dict = None):
         self.con = con
@@ -561,6 +582,30 @@ class CryptoDataPipeline:
                 PARTITION BY toYYYYMM(timestamp)
                 SETTINGS index_granularity = 8192
             """)
+
+        # Create funding rates table
+        self.con.execute(f"""
+            CREATE TABLE IF NOT EXISTS {db}.bn_funding_rates (
+                {self.FUNDING_RATES_SCHEMA}
+            )
+            ENGINE = ReplacingMergeTree()
+            PRIMARY KEY (symbol, exchange, fundingTime)
+            ORDER BY (symbol, exchange, fundingTime)
+            PARTITION BY toYYYYMM(fundingTime)
+            SETTINGS index_granularity = 8192
+        """)
+
+        # Create margin interest rates table
+        self.con.execute(f"""
+            CREATE TABLE IF NOT EXISTS {db}.bn_margin_rates (
+                {self.MARGIN_RATES_SCHEMA}
+            )
+            ENGINE = ReplacingMergeTree()
+            PRIMARY KEY (asset, exchange, timestamp)
+            ORDER BY (asset, exchange, timestamp)
+            PARTITION BY toYYYYMM(timestamp)
+            SETTINGS index_granularity = 8192
+        """)
 
         self.logger.info(f"Database {db} initialized successfully")
 
@@ -646,6 +691,34 @@ class CryptoDataPipeline:
             )
             self.load_cache_to_clickhouse(cache_dir, f'bn_perp_klines_{interval_safe}')
 
+    def update_funding_rates(self, start_time: str = None, end_time: str = None):
+        """Update funding rates"""
+        from additional_data import FundingRatesFetcher
+
+        if start_time is None:
+            start_time = self.config['bars']['start_date']
+        if end_time is None:
+            end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+        cache_dir = CACHE_DIR / 'funding_rates'
+        fetcher = FundingRatesFetcher(self.fetcher.um_futures_client, self.con, self.config)
+        fetcher.fetch_all_to_cache(start_time, end_time, cache_dir)
+        self.load_cache_to_clickhouse(cache_dir, 'bn_funding_rates')
+
+    def update_margin_rates(self, start_time: str = None, end_time: str = None):
+        """Update margin interest rates"""
+        from additional_data import MarginRatesFetcher
+
+        if start_time is None:
+            start_time = self.config['bars']['start_date']
+        if end_time is None:
+            end_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+        cache_dir = CACHE_DIR / 'margin_rates'
+        fetcher = MarginRatesFetcher(self.fetcher.spot_client, self.con, self.config)
+        fetcher.fetch_all_to_cache(start_time, end_time, cache_dir)
+        self.load_cache_to_clickhouse(cache_dir, 'bn_margin_rates')
+
     def update_all(self):
         """Run full update for all configured intervals"""
         self._initialize_database()
@@ -654,5 +727,11 @@ class CryptoDataPipeline:
         for interval in self.config['bars']['intervals']:
             self.logger.info(f"Updating {interval} klines...")
             self.update_klines(interval=interval)
+
+        self.logger.info("Updating funding rates...")
+        self.update_funding_rates()
+
+        self.logger.info("Updating margin rates...")
+        self.update_margin_rates()
 
         self.logger.info("Full update completed")

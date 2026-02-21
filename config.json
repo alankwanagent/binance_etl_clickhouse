@@ -28,8 +28,8 @@
     }
   },
   "rate_limits": {
-    "spot_workers": 6,
-    "futures_workers": 4,
+    "spot_workers": 10,
+    "futures_workers": 6,
     "update_interval_seconds": 3600
   }
 }
