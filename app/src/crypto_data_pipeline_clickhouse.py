@@ -53,10 +53,19 @@ class BinanceDataFetcher:
 
     def __init__(self, con, api_key: Optional[str] = None, api_secret: Optional[str] = None,
                  config: dict = None):
-        self.spot_client = Spot(api_key=api_key, api_secret=api_secret)
-        self.um_futures_client = UMFutures(key=api_key, secret=api_secret)
         self.con = con
         self.config = config or load_config()
+
+        # Proxy setup
+        proxies = None
+        if self.config.get('proxy', {}).get('enabled', False):
+            proxy_url = self.config['proxy'].get('http')
+            if proxy_url:
+                proxies = {'http': proxy_url, 'https': proxy_url}
+                logging.info(f"Using proxy: {proxy_url}")
+
+        self.spot_client = Spot(api_key=api_key, api_secret=api_secret, proxies=proxies)
+        self.um_futures_client = UMFutures(key=api_key, secret=api_secret, proxies=proxies)
 
         # Override workers from config
         rate_limits = self.config.get('rate_limits', {})

@@ -7,6 +7,10 @@
     "password": "iamsentient",
     "secure": false
   },
+  "proxy": {
+    "enabled": true,
+    "http": "http://100.117.118.21:6969"
+  },
   "bars": {
     "intervals": ["1m", "1h"],
     "start_date": "2017-01-01",
@@ -21,8 +25,8 @@
     }
   },
   "rate_limits": {
-    "spot_workers": 3,
-    "futures_workers": 2,
+    "spot_workers": 5,
+    "futures_workers": 3,
     "update_interval_seconds": 3600
   }
 }
