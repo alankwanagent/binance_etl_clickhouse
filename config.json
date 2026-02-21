@@ -9,7 +9,10 @@
   },
   "proxy": {
     "enabled": true,
-    "http": "http://100.117.118.21:6969"
+    "pool": [
+      "http://100.117.118.21:6969",
+      "http://100.101.79.51:6969"
+    ]
   },
   "bars": {
     "intervals": ["1m", "1h"],
@@ -25,8 +28,8 @@
     }
   },
   "rate_limits": {
-    "spot_workers": 5,
-    "futures_workers": 3,
+    "spot_workers": 6,
+    "futures_workers": 4,
     "update_interval_seconds": 3600
   }
 }
