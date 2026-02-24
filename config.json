@@ -15,7 +15,7 @@
     ]
   },
   "bars": {
-    "intervals": ["1m", "1h"],
+    "intervals": ["1m"],
     "start_date": "2017-01-01",
     "symbols": {
       "spot": {
